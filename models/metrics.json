@@ -1,0 +1,42 @@
+{
+  "model_version": 3,
+  "selected_classifier": "hist_gradient_boosting",
+  "trained_at_utc": "2026-10-14T18:17:54.161273+00:00",
+  "split_rows": {
+    "train": 169586,
+    "validation": 36340,
+    "test": 36340
+  },
+  "validation_balanced_accuracy_by_model": {
+    "logistic_regression": 0.6182437799392628,
+    "random_forest": 0.675866632773432,
+    "hist_gradient_boosting": 0.6832487560473208
+  },
+  "test_accuracy": 0.6415795266923501,
+  "test_balanced_accuracy": 0.6351677652364474,
+  "test_precision": 0.7310386231739043,
+  "test_recall": 0.41410191010599107,
+  "test_f1": 0.5287115099323371,
+  "test_confusion_matrix": [
+    [
+      16009,
+      2688
+    ],
+    [
+      10337,
+      7306
+    ]
+  ],
+  "test_majority_direction_baseline_accuracy": 0.5145019262520638,
+  "test_roc_auc": 0.6756554697530691,
+  "test_close_mae_inr": 1790739.6652484967,
+  "test_close_rmse_inr": 2207780.5493468954,
+  "test_close_mape_pct": 23.216335884305494,
+  "naive_close_baseline_mae_inr": 20373.368604843152,
+  "naive_close_baseline_rmse_inr": 29716.156064987095,
+  "naive_close_baseline_mape_pct": 0.2640378499529616,
+  "test_rows": 36340,
+  "test_start": "2025-10-01 05:45:00+05:30",
+  "test_end": "2026-10-14 23:15:00+05:30",
+  "warning": "Historical metrics do not imply future profitability; fees, slippage, taxes and execution are not modeled."
+}

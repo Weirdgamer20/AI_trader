@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+data/raw/*.csv
+data/processed/*
+data/reconstructed/*
+models/*.joblib
+models/*.csv
+!models/metrics.json
+.streamlit/
