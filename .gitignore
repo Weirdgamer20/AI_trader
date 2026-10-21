@@ -11,3 +11,5 @@ models/*.joblib
 models/*.csv
 !models/metrics.json
 .streamlit/
+data/*.db
+data/*.db-*

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "CoinDCX Spot AI Trading Overlay",
+  "version": "1.0.0",
+  "description": "Click-through AI forecasting HUD for CoinDCX Spot markets. Non-interfering and non-custodial.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://coindcx.com/*",
+    "https://*.coindcx.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://coindcx.com/*",
+        "https://*.coindcx.com/*"
+      ],
+      "js": ["overlay.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

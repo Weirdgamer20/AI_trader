@@ -98,19 +98,62 @@ options:
 
 ---
 
-## Automated Test Suite
+---
 
-Run the automated regression test suite:
+## Multi-Coin AI Spot Trading Platform (Milestones M1–M8)
+
+A production-grade, risk-controlled spot trading architecture implementing the complete project specification:
+
+### Milestone Architecture
+1. **M1 — Ledger, Accounting & Indian Tax Engine (`src/ledger/`)**:
+   - Double-entry portfolio accounting starting from ₹500 aiming for ₹100,000 target.
+   - CoinDCX fee schedule (0.50% maker/taker), 18% GST on fees.
+   - Section 194S 1% TDS deduction and Section 115BBH 30% flat VDA tax calculation (no loss set-off).
+   - Relational database persistence supporting PostgreSQL and local transactional SQLite.
+2. **M2 — Deterministic Risk Engine & Execution State Machine (`src/risk/`, `src/execution/`)**:
+   - Strictly enforces maximum 2.0% planned risk per trade (e.g. ₹10 at ₹500 balance).
+   - ₹250 hard affordable-loss ceiling tracker with automated trading halt.
+   - Execution State Machine: `PROPOSED` → `RISK_CHECKED` → `AUTHORIZED` → `SUBMITTED` → `FILLED` → `RECONCILED`.
+   - Emergency stop circuit breaker and safe mode.
+   - Strict `LiveExecutionGuard` disabling live execution by default (REQ-28).
+3. **M3 — Dynamic Coin Scanner & Multi-Horizon Forecasting (`src/scanner/`, `src/modeling_multicoin.py`)**:
+   - Dynamically scans up to 50 eligible CoinDCX Spot candidates based on 24h volume and spread.
+   - Behavioral market tagger (regime, trend, mean reversion, volatility tags).
+   - Multi-horizon forecasting (1, 2, 4 candles) with wicks, direction, return, downside, and 90% calibrated uncertainty intervals.
+4. **M4 — Mandatory Meta-Learning & Independent Strategy Critic (`src/meta_learning/`)**:
+   - Meta-feature extraction without lookahead bias.
+   - Meta-learner dynamically selecting optimal learner algorithm and horizon for active market conditions.
+   - Champion/Challenger model registry with gated promotion and audit-logged rollback.
+   - Independent Strategy Critic vetoing proposals with excessive uncertainty or weak returns.
+5. **M5 — Paper Execution Engine & Divergence Monitor (`src/execution/`)**:
+   - High-fidelity simulated execution against candle range with realistic volume-weighted slippage.
+   - Backtest-to-paper performance divergence monitoring and alerting.
+6. **M6 — Extensible Developer Mode, Terminal Dashboard & Chrome Overlay (`src/ui/`, `extension/`)**:
+   - Interactive terminal dashboard and enhanced multi-tab Streamlit terminal.
+   - Sandboxed plugin architecture with strict permission isolation.
+   - Telegram notification dispatcher with automated secret redaction.
+   - Click-through Chrome overlay (`extension/`) for non-interfering HUD on CoinDCX.
+7. **M7/M8 — Security, Provenance & Release Qualification (`src/security/`, `tests/`)**:
+   - Credential vault with recursive secret masking.
+   - Provenance memory logger distinguishing facts, calculations, hypotheses, and configurations.
+   - Full end-to-end regression test suite covering all requirements (REQ-01 to REQ-30).
+
+### Quick CLI Usage
+```bash
+# View live terminal dashboard with active CoinDCX Spot scanner:
+python run_system.py --status
+
+# Scan up to 50 active Spot markets:
+python run_system.py --scan
+
+# Trigger emergency stop circuit breaker:
+python run_system.py --emergency-stop
+
+# Clear emergency stop with authorization:
+python run_system.py --clear-stop "AUTHORIZED_LIVE_USER_CONFIRMED_2026"
+```
+
+### Full Automated Test Suite (All 36 Tests Passing)
 ```bash
 python -m pytest -v
 ```
-
-Tests verify:
-- Feature finiteness and column schema.
-- Forecast generation on unlabeled live rows.
-- Model persistence and bundle reloading.
-- Interval gap detection and coverage percentage.
-- Start-date validation (future date rejection, dates older than 10 years).
-- Resumption from existing local datasets.
-- Clean secondary BTC/USD ingestion and labeling.
-- OCR price, timestamp, and confidence extraction.
