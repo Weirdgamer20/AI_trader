@@ -29,27 +29,26 @@
     <div class="hud-body">
       <div class="hud-metric-row">
         <span class="hud-label">Model Signal:</span>
-        <span class="hud-val text-green" id="hud-signal">UP (62% Calibrated)</span>
+        <span class="hud-val text-cyan" id="hud-signal">DATA UNAVAILABLE</span>
       </div>
       <div class="hud-metric-row">
         <span class="hud-label">Expected Net Ret:</span>
-        <span class="hud-val" id="hud-net-return">+2.15% (After Fees)</span>
+        <span class="hud-val" id="hud-net-return">--</span>
       </div>
       <div class="hud-metric-row">
         <span class="hud-label">Uncertainty Band:</span>
-        <span class="hud-val" id="hud-uncertainty">±2.4% (90% Conf)</span>
+        <span class="hud-val" id="hud-uncertainty">--</span>
       </div>
       <div class="hud-metric-row">
         <span class="hud-label">Planned Risk/Trade:</span>
-        <span class="hud-val" id="hud-risk">Max 2.0% (₹10 at ₹500)</span>
+        <span class="hud-val" id="hud-risk">Max 2.0% (Strict Cap)</span>
       </div>
       <div class="hud-metric-row">
         <span class="hud-label">Loss Ceiling:</span>
         <span class="hud-val text-cyan" id="hud-ceiling">₹250 Hard Limit</span>
       </div>
       <div class="hud-tags" id="hud-tags">
-        <span class="hud-tag">TRENDING_BULLISH</span>
-        <span class="hud-tag">LIQUID_SPOT</span>
+        <span class="hud-tag">AWAITING_LOCAL_API</span>
       </div>
     </div>
     <div class="hud-footer">
@@ -69,11 +68,20 @@
         if (data.signal) document.getElementById('hud-signal').textContent = data.signal;
         if (data.net_return) document.getElementById('hud-net-return').textContent = data.net_return;
         if (data.uncertainty) document.getElementById('hud-uncertainty').textContent = data.uncertainty;
+        if (data.tags && Array.isArray(data.tags)) {
+          const tagsContainer = document.getElementById('hud-tags');
+          tagsContainer.innerHTML = data.tags.map(t => `<span class="hud-tag">${t}</span>`).join(' ');
+        }
+      } else {
+        document.getElementById('hud-signal').textContent = 'LOCAL API ERROR';
       }
     } catch (e) {
-      // Local server offline; HUD retains default baseline indicator safely
+      document.getElementById('hud-signal').textContent = 'DATA UNAVAILABLE (OFFLINE)';
+      document.getElementById('hud-net-return').textContent = '--';
+      document.getElementById('hud-uncertainty').textContent = '--';
     }
   }
 
-  setInterval(updateOverlayData, 15000);
+  updateOverlayData();
+  setInterval(updateOverlayData, 10000);
 })();

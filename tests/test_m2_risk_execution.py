@@ -13,21 +13,35 @@ def test_risk_engine_enforces_two_percent_risk(tmp_path):
     ceiling = AffordableLossCeiling(db=db, account_id="acc1")
     engine = DeterministicRiskEngine(ledger=ledger, ceiling=ceiling)
 
-    # Initial balance is ₹500. 2% risk limit = ₹10.
+    # Initial balance is ₹500. Strict 2% risk limit = ₹10.00.
     # Current price = ₹1000, stop loss = ₹900 (10% downside).
     # Desired notional = 10 / (0.10 + 0.003) ~ ₹97.08
-    # With min order ₹100, notional is ₹100, implied risk ~ ₹10.3 (within 15% tolerance).
+    # With min order ₹100, if notional ₹100 produces risk > ₹10.00, it must be rejected!
+    # Here with current_price=1000, stop_loss=950 (5% downside):
+    # notional = 10 / (0.05 + 0.003) = ₹188.67 >= 100, risk is strictly <= 10.0
     res = engine.evaluate_order_proposal(
         market_pair="I-BTC_INR",
         side="BUY",
         current_price=1000.0,
-        proposed_stop_loss=900.0,
+        proposed_stop_loss=950.0,
         bid_price=999.0,
         ask_price=1001.0,
     )
     assert res["approved"] is True
-    assert res["planned_risk_inr"] <= 12.0 # Enforces ~2% planned loss
+    assert res["planned_risk_inr"] <= 10.0001 # Strict 2% hard risk limit
     assert res["quantity"] > 0
+
+    # P0-2: Verify rejection if planned risk exceeds 2% cap
+    res_excess = engine.evaluate_order_proposal(
+        market_pair="I-BTC_INR",
+        side="BUY",
+        current_price=1000.0,
+        proposed_stop_loss=800.0, # 20% downside -> min order 100 produces risk 20.3 > 10.0
+        bid_price=999.0,
+        ask_price=1001.0,
+    )
+    assert res_excess["approved"] is False
+    assert "strictly exceeding the 2% hard risk limit" in res_excess["rejection_reason"]
 
 def test_risk_engine_rejects_excessive_spread(tmp_path):
     db = DatabaseManager(db_path=tmp_path / "test.db")
@@ -75,9 +89,9 @@ def test_execution_state_machine_happy_path(tmp_path):
     emerg = EmergencyStopSystem(db=db, account_id="acc4")
     sm = ExecutionStateMachine(db=db, ledger=ledger, risk_engine=engine, emergency_system=emerg)
 
-    # Propose order
+    # Propose order (price ₹50,000, stop loss ₹47,600 = ~5% downside, fits within ₹10 (2%) risk cap)
     prop = sm.propose_order(
-        market_pair="I-BTC_INR", side="BUY", current_price=50000.0, proposed_stop_loss=45000.0,
+        market_pair="I-BTC_INR", side="BUY", current_price=50000.0, proposed_stop_loss=47600.0,
         bid_price=49990.0, ask_price=50010.0, idempotency_key="key-1"
     )
     assert prop["success"] is True
@@ -109,15 +123,15 @@ def test_live_guard_rejects_unauthorized_activation():
     guard = LiveExecutionGuard()
     assert guard.is_live_trading_enabled() is False
 
-    # Missing gates
+    # Missing environment variable / unconfigured secret
     res1 = guard.authorize_live_trading(
-        token="AUTHORIZED_LIVE_USER_CONFIRMED_2026",
+        token="SOME_TOKEN",
         gates_checklist={"m1_data_integrity_passed": True},
     )
     assert res1["success"] is False
     assert guard.is_live_trading_enabled() is False
 
-    # Bad token
+    # All gates True but missing secret or execution adapter
     all_gates = {
         "m1_data_integrity_passed": True,
         "m2_risk_engine_verified": True,
@@ -127,11 +141,16 @@ def test_live_guard_rejects_unauthorized_activation():
         "loss_ceiling_active": True,
         "no_open_emergency_stop": True,
     }
-    res2 = guard.authorize_live_trading(token="WRONG_TOKEN", gates_checklist=all_gates)
+    # P0-1: With no LIVE_TRADING_AUTHORIZATION_TOKEN configured, fail closed
+    res2 = guard.authorize_live_trading(token="AUTHORIZED_LIVE_USER_CONFIRMED_2026", gates_checklist=all_gates)
     assert res2["success"] is False
     assert guard.is_live_trading_enabled() is False
 
-    # Valid authorization
-    res3 = guard.authorize_live_trading(token="AUTHORIZED_LIVE_USER_CONFIRMED_2026", gates_checklist=all_gates)
-    assert res3["success"] is True
-    assert guard.is_live_trading_enabled() is True
+    # Even if environment variable is set, live trading remains disabled without verified qualification evidence & live execution adapter
+    import os
+    os.environ["LIVE_TRADING_AUTHORIZATION_TOKEN"] = "SUPER_SECURE_TOKEN_2026"
+    res3 = guard.authorize_live_trading(token="SUPER_SECURE_TOKEN_2026", gates_checklist=all_gates)
+    assert res3["success"] is False
+    assert ("Live exchange adapter not connected" in res3["reason"] or "qualification gates" in res3["reason"])
+    assert guard.is_live_trading_enabled() is False
+    del os.environ["LIVE_TRADING_AUTHORIZATION_TOKEN"]

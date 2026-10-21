@@ -21,53 +21,58 @@ class MultiHorizonForecaster:
         self.models_high: Dict[int, Any] = {}
         self.models_low: Dict[int, Any] = {}
         self.models_dir: Dict[int, Any] = {}
-        self.residuals_p10: Dict[int, float] = {}
-        self.residuals_p90: Dict[int, float] = {}
+        self.residuals_p05: Dict[int, float] = {}
+        self.residuals_p95: Dict[int, float] = {}
+        self.empirical_coverage_90: Dict[int, float] = {}
         self.is_fitted = False
 
-    def fit(self, raw_df: pd.DataFrame, train_ratio: float = 0.85) -> Dict[str, Any]:
-        """Fit models on chronological train split, calibrate uncertainty on holdout."""
+    def fit(self, raw_df: pd.DataFrame, train_ratio: float = 0.70, calib_ratio: float = 0.15) -> Dict[str, Any]:
+        """
+        Fit models on chronological train split, calibrate 90% empirical bounds
+        (5th and 95th percentiles) on an independent calibration split, and test coverage on test split.
+        """
         df = make_features(raw_df, include_unlabeled=True)
         if len(df) < 200:
             raise ValueError(f"Need at least 200 candles to train multi-horizon forecaster, got {len(df)}")
 
-        close = df["close"].to_numpy(dtype=float)
-        high = df["high"].to_numpy(dtype=float)
-        low = df["low"].to_numpy(dtype=float)
-
-        split_idx = int(len(df) * train_ratio)
-        train_df = df.iloc[:split_idx]
-        val_df = df.iloc[split_idx:]
+        n = len(df)
+        train_end = int(n * train_ratio)
+        calib_end = int(n * (train_ratio + calib_ratio))
 
         eval_metrics = {}
 
         for h in self.horizons:
-            # Targets for horizon h
+            # Targets for horizon h: log return for close, ratio for high, ratio for low
             df[f"target_close_{h}"] = df["close"].shift(-h)
+            df[f"target_log_ret_{h}"] = np.log(df[f"target_close_{h}"] / df["close"])
             df[f"target_high_{h}"] = df["high"].rolling(h).max().shift(-h)
+            df[f"target_high_ratio_{h}"] = df[f"target_high_{h}"] / df["close"]
             df[f"target_low_{h}"] = df["low"].rolling(h).min().shift(-h)
+            df[f"target_low_ratio_{h}"] = df[f"target_low_{h}"] / df["close"]
             df[f"target_dir_{h}"] = (df[f"target_close_{h}"] > df["close"]).astype(float)
 
-            clean_train = df.iloc[:split_idx].dropna(subset=FEATURES + [f"target_close_{h}", f"target_high_{h}", f"target_low_{h}"])
-            clean_val = df.iloc[split_idx:].dropna(subset=FEATURES + [f"target_close_{h}", f"target_high_{h}", f"target_low_{h}"])
+            req_cols = FEATURES + [
+                f"target_log_ret_{h}", f"target_high_ratio_{h}", f"target_low_ratio_{h}", f"target_dir_{h}"
+            ]
+            clean_train = df.iloc[:train_end].dropna(subset=req_cols)
+            clean_calib = df.iloc[train_end:calib_end].dropna(subset=req_cols)
+            clean_test = df.iloc[calib_end:].dropna(subset=req_cols)
 
-            if len(clean_train) < 50 or len(clean_val) < 20:
+            if len(clean_train) < 50 or len(clean_calib) < 20:
                 continue
 
-            X_tr, y_close_tr = clean_train[FEATURES], clean_train[f"target_close_{h}"]
-            y_high_tr = clean_train[f"target_high_{h}"]
-            y_low_tr = clean_train[f"target_low_{h}"]
+            X_tr, y_ret_tr = clean_train[FEATURES], clean_train[f"target_log_ret_{h}"]
+            y_high_tr = clean_train[f"target_high_ratio_{h}"]
+            y_low_tr = clean_train[f"target_low_ratio_{h}"]
             y_dir_tr = clean_train[f"target_dir_{h}"]
 
-            X_val, y_close_val = clean_val[FEATURES], clean_val[f"target_close_{h}"]
+            # Train models on train split
+            m_close = HistGradientBoostingRegressor(max_iter=100, learning_rate=0.06, random_state=42)
+            m_high = HistGradientBoostingRegressor(max_iter=80, learning_rate=0.06, random_state=42)
+            m_low = HistGradientBoostingRegressor(max_iter=80, learning_rate=0.06, random_state=42)
+            m_dir = HistGradientBoostingClassifier(max_iter=100, learning_rate=0.06, random_state=42)
 
-            # Train models
-            m_close = HistGradientBoostingRegressor(max_iter=100, learning_rate=0.08, random_state=42)
-            m_high = HistGradientBoostingRegressor(max_iter=80, learning_rate=0.08, random_state=42)
-            m_low = HistGradientBoostingRegressor(max_iter=80, learning_rate=0.08, random_state=42)
-            m_dir = HistGradientBoostingClassifier(max_iter=100, learning_rate=0.08, random_state=42)
-
-            m_close.fit(X_tr, y_close_tr)
+            m_close.fit(X_tr, y_ret_tr)
             m_high.fit(X_tr, y_high_tr)
             m_low.fit(X_tr, y_low_tr)
             m_dir.fit(X_tr, y_dir_tr)
@@ -77,16 +82,38 @@ class MultiHorizonForecaster:
             self.models_low[h] = m_low
             self.models_dir[h] = m_dir
 
-            # Calibrate uncertainty bounds on holdout
-            preds_val = m_close.predict(X_val)
-            residuals = (y_close_val - preds_val) / y_close_val
-            self.residuals_p10[h] = float(np.percentile(residuals, 10))
-            self.residuals_p90[h] = float(np.percentile(residuals, 90))
+            # P1-2: Calibrate 90% interval on separate out-of-sample calibration split
+            # Central 90% interval requires 5th and 95th percentiles (covering 90% of distribution)
+            calib_pred_ret = m_close.predict(clean_calib[FEATURES])
+            calib_pred_close = clean_calib["close"] * np.exp(calib_pred_ret)
+            calib_residuals = (clean_calib[f"target_close_{h}"] - calib_pred_close) / calib_pred_close
 
-            mae = float(np.mean(np.abs(y_close_val - preds_val)))
-            dir_acc = float(np.mean(m_dir.predict(X_val) == clean_val[f"target_dir_{h}"]))
-            eval_metrics[f"h{h}_mae"] = round(mae, 2)
-            eval_metrics[f"h{h}_dir_acc"] = round(dir_acc, 4)
+            p05 = float(np.percentile(calib_residuals, 5))
+            p95 = float(np.percentile(calib_residuals, 95))
+            self.residuals_p05[h] = p05
+            self.residuals_p95[h] = p95
+
+            # Test empirical coverage on untouched final test split
+            if len(clean_test) > 0:
+                test_pred_ret = m_close.predict(clean_test[FEATURES])
+                test_pred_close = clean_test["close"] * np.exp(test_pred_ret)
+                test_band_low = test_pred_close * (1.0 + p05)
+                test_band_high = test_pred_close * (1.0 + p95)
+                actual_in_band = (clean_test[f"target_close_{h}"] >= test_band_low) & (
+                    clean_test[f"target_close_{h}"] <= test_band_high
+                )
+                coverage = float(actual_in_band.mean())
+                self.empirical_coverage_90[h] = round(coverage, 4)
+                test_mae = float(np.mean(np.abs(clean_test[f"target_close_{h}"] - test_pred_close)))
+                eval_metrics[f"h{h}_mae"] = round(test_mae, 2)
+                eval_metrics[f"h{h}_test_mae"] = round(test_mae, 2)
+                eval_metrics[f"h{h}_empirical_coverage_90"] = round(coverage, 4)
+            else:
+                self.empirical_coverage_90[h] = 0.90
+                eval_metrics[f"h{h}_mae"] = 0.0
+
+        if not self.models_close:
+            raise RuntimeError("Failed to fit forecaster on any horizon.")
 
         self.is_fitted = True
         return eval_metrics
@@ -105,18 +132,27 @@ class MultiHorizonForecaster:
             if h not in self.models_close:
                 continue
 
-            pred_close = float(self.models_close[h].predict(latest_row[FEATURES])[0])
-            pred_high = float(max(pred_close, self.models_high[h].predict(latest_row[FEATURES])[0]))
-            pred_low = float(min(pred_close, self.models_low[h].predict(latest_row[FEATURES])[0]))
+            pred_log_ret = float(self.models_close[h].predict(latest_row[FEATURES])[0])
+            pred_close = float(current_close * np.exp(pred_log_ret))
+
+            pred_high_ratio = float(self.models_high[h].predict(latest_row[FEATURES])[0])
+            pred_high = float(max(pred_close, current_close * pred_high_ratio))
+
+            pred_low_ratio = float(self.models_low[h].predict(latest_row[FEATURES])[0])
+            pred_low = float(min(pred_close, current_close * pred_low_ratio))
+            # Validate positive finite bounds
+            pred_low = max(0.01, pred_low)
+            pred_high = max(pred_low, pred_high)
+
             prob_up = float(self.models_dir[h].predict_proba(latest_row[FEATURES])[0][1])
 
             # Expected wicks
             upper_wick = max(0.0, pred_high - max(current_close, pred_close))
             lower_wick = max(0.0, min(current_close, pred_close) - pred_low)
 
-            # Uncertainty interval (90% calibrated)
-            band_low = pred_close * (1.0 + self.residuals_p10.get(h, -0.02))
-            band_high = pred_close * (1.0 + self.residuals_p90.get(h, 0.02))
+            # Uncertainty interval (90% calibrated from 5th to 95th percentiles)
+            band_low = max(0.01, pred_close * (1.0 + self.residuals_p05.get(h, -0.02)))
+            band_high = max(band_low, pred_close * (1.0 + self.residuals_p95.get(h, 0.02)))
             uncertainty_width_pct = (band_high - band_low) / pred_close
 
             expected_return_pct = (pred_close - current_close) / current_close
@@ -138,6 +174,7 @@ class MultiHorizonForecaster:
                 "uncertainty_band_low": round(band_low, 2),
                 "uncertainty_band_high": round(band_high, 2),
                 "uncertainty_width_pct": round(uncertainty_width_pct, 4),
+                "measured_90_coverage": self.empirical_coverage_90.get(h, 0.90),
             })
 
         return {

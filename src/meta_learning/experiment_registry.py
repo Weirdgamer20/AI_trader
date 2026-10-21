@@ -14,8 +14,20 @@ class ExperimentRegistry:
     def __init__(self, db: DatabaseManager, registry_dir: Path | str | None = None):
         self.db = db
         self.registry_dir = Path(registry_dir or "models/registry")
-        self.registry_dir.mkdir(parents=True, exist_ok=True)
-        self.active_champion: Dict[str, Any] = {
+        self.registry_file = self.registry_dir / "registry.json"
+        self._load_registry()
+
+    def _load_registry(self) -> None:
+        if self.registry_file.exists():
+            try:
+                data = json.loads(self.registry_file.read_text(encoding="utf-8"))
+                self.active_champion = data.get("active_champion")
+                self.history = data.get("history", [])
+                return
+            except Exception:
+                pass
+        # Seed default verified baseline champion if none persisted yet
+        self.active_champion = {
             "model_id": "champ-baseline-hgb-v1",
             "algorithm": "hist_gradient_boosting",
             "horizon": 1,
@@ -23,7 +35,17 @@ class ExperimentRegistry:
             "val_mae": 1500.0,
             "promoted_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.history: List[Dict[str, Any]] = [dict(self.active_champion)]
+        self.history = []
+        self._save_registry()
+
+    def _save_registry(self) -> None:
+        self.registry_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "active_champion": self.active_champion,
+            "history": self.history,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.registry_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def register_challenger(
         self,
@@ -46,16 +68,22 @@ class ExperimentRegistry:
         }
 
         # Gated promotion check:
-        # Challenger must have higher validation accuracy AND lower or equal MAE
-        current_acc = self.active_champion["val_accuracy"]
-        current_mae = self.active_champion["val_mae"]
-
-        is_promoted = (val_accuracy >= current_acc + 0.005) and (val_mae <= current_mae)
+        if self.active_champion is None:
+            # First validated challenger becomes initial champion
+            is_promoted = True
+            current_acc = 0.0
+            current_mae = float("inf")
+        else:
+            current_acc = self.active_champion.get("val_accuracy", 0.0)
+            current_mae = self.active_champion.get("val_mae", float("inf"))
+            is_promoted = (val_accuracy >= current_acc + 0.005) and (val_mae <= current_mae)
 
         if is_promoted:
             challenger["promoted_at"] = datetime.now(timezone.utc).isoformat()
-            self.history.append(dict(self.active_champion))
+            if self.active_champion is not None:
+                self.history.append(dict(self.active_champion))
             self.active_champion = dict(challenger)
+            self._save_registry()
 
             # Record audit event
             with self.db.session() as conn:
@@ -76,7 +104,7 @@ class ExperimentRegistry:
         return {
             "challenger_id": model_id,
             "promoted_to_champion": is_promoted,
-            "active_champion_id": self.active_champion["model_id"],
+            "active_champion_id": self.active_champion["model_id"] if self.active_champion else None,
             "comparison": {
                 "challenger_acc": val_accuracy,
                 "champion_acc": current_acc,
@@ -91,8 +119,9 @@ class ExperimentRegistry:
             return {"success": False, "message": "No previous champion available in history."}
 
         previous = self.history.pop()
-        old_champion_id = self.active_champion["model_id"]
+        old_champion_id = self.active_champion["model_id"] if self.active_champion else None
         self.active_champion = dict(previous)
+        self._save_registry()
 
         now_iso = datetime.now(timezone.utc).isoformat()
         with self.db.session() as conn:

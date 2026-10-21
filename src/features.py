@@ -56,10 +56,15 @@ def make_features(raw: pd.DataFrame, include_unlabeled: bool = False) -> pd.Data
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["macd_pct"] = (ema12 - ema26) / close
 
-    # Row t features use only row t and earlier. Label is next candle close/direction.
+    # Row t features use only row t and earlier. Label is next candle close/direction/log_return.
     df["target_close"] = close.shift(-1)
+    df["target_log_return"] = np.where(
+        (df["target_close"].notna()) & (close > 0) & (df["target_close"] > 0),
+        np.log(df["target_close"] / close),
+        np.nan,
+    )
     df["target_up"] = np.where(df["target_close"].notna(), (df["target_close"] > close).astype(float), np.nan)
     df = df.replace([np.inf, -np.inf], np.nan)
     if include_unlabeled:
         return df.dropna(subset=FEATURES).reset_index(drop=True)
-    return df.dropna(subset=FEATURES + ["target_close", "target_up"]).reset_index(drop=True)
+    return df.dropna(subset=FEATURES + ["target_close", "target_up", "target_log_return"]).reset_index(drop=True)

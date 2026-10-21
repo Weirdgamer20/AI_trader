@@ -20,9 +20,20 @@ class MetaLearnerSelector:
         """
         Maps meta-features to the highest expected utility configuration.
         """
-        vol = meta_features.get("volatility_regime", 0.01)
-        trend = meta_features.get("trend_strength", 0.0)
-        expansion = meta_features.get("range_expansion", 1.0)
+        if meta_features.get("status") == "DATA_INSUFFICIENT" or meta_features.get("is_valid") is False:
+            return {
+                "status": "DATA_INSUFFICIENT",
+                "can_trade": False,
+                "selected_algorithm": None,
+                "selected_horizon_candles": None,
+                "entry_confidence_threshold": None,
+                "rational": "Insufficient candle data to establish market regime. Trade proposals blocked.",
+                "meta_features_snapshot": meta_features,
+            }
+
+        vol = meta_features.get("volatility_regime") or 0.01
+        trend = meta_features.get("trend_strength") or 0.0
+        expansion = meta_features.get("range_expansion") or 1.0
 
         # Meta-selection heuristics grounded in walk-forward empirical stability
         if "HIGH_VOLATILITY" in active_tags or vol > 0.018:

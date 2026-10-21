@@ -36,10 +36,10 @@ def test_req_09_and_10_risk_and_loss_ceiling(tmp_path):
     ceiling = AffordableLossCeiling(db=db, account_id="req_acc", ceiling_limit_inr=250.0)
     engine = DeterministicRiskEngine(ledger=ledger, ceiling=ceiling)
 
-    # Initial equity ₹500 -> 2% planned loss = ₹10.0
-    eval1 = engine.evaluate_order_proposal("I-BTC_INR", "BUY", current_price=1000.0, proposed_stop_loss=900.0)
+    # Initial equity ₹500 -> strict 2% planned loss = ₹10.00 max
+    eval1 = engine.evaluate_order_proposal("I-BTC_INR", "BUY", current_price=1000.0, proposed_stop_loss=950.0)
     assert eval1["approved"] is True
-    assert eval1["planned_risk_inr"] <= 12.0 # strictly ~2%
+    assert eval1["planned_risk_inr"] <= 10.0001 # strictly <= 2% (₹10.00)
 
     # Simulate ₹250 loss breach
     with db.session() as conn:

@@ -55,6 +55,8 @@ class PaperTradingEngine:
         high = current_candle["high"]
         low = current_candle["low"]
 
+        order_type = (order["order_type"] or "LIMIT").upper()
+
         # Check market reachability:
         # A BUY limit order fills if market trades at or below limit price.
         # A SELL order fills if market trades at or above limit price.
@@ -68,13 +70,37 @@ class PaperTradingEngine:
                 "reason": f"Price ₹{limit_price} not reached in candle range [₹{low}, ₹{high}]",
             }
 
-        # Model realistic slippage:
-        slippage_sign = 1.0 if side == "BUY" else -1.0
-        slippage_pct = self.base_slippage_pct
-        effective_fill_price = round(limit_price * (1.0 + (slippage_sign * slippage_pct)), 2)
+        # Model realistic execution price:
+        # For limit orders: BUY must fill <= limit_price; SELL must fill >= limit_price
+        # Using ask for BUY and bid for SELL if provided and within reach
+        if side == "BUY":
+            base_ref = ask if (ask is not None and ask <= limit_price) else min(limit_price, current_candle["close"])
+            # Slippage on limit buy can only occur between low and limit_price (favorable or up to limit)
+            # Never exceed limit_price for a limit order!
+            if order_type == "LIMIT":
+                effective_fill_price = min(limit_price, max(low, base_ref * (1.0 + self.base_slippage_pct * random.uniform(0.1, 0.5))))
+                effective_fill_price = min(limit_price, effective_fill_price)
+            else:
+                # Market order can slip above close/ask
+                effective_fill_price = max(low, min(high, base_ref * (1.0 + self.base_slippage_pct)))
+        else: # SELL
+            base_ref = bid if (bid is not None and bid >= limit_price) else max(limit_price, current_candle["close"])
+            if order_type == "LIMIT":
+                # Never fill below limit_price for a limit sell!
+                effective_fill_price = max(limit_price, min(high, base_ref * (1.0 - self.base_slippage_pct * random.uniform(0.1, 0.5))))
+                effective_fill_price = max(limit_price, effective_fill_price)
+            else:
+                # Market sell can slip below close/bid
+                effective_fill_price = max(low, min(high, base_ref * (1.0 - self.base_slippage_pct)))
 
-        # Ensure fill price remains bounded by candle high/low
+        effective_fill_price = round(effective_fill_price, 2)
+        # Bounded strictly within candle
         effective_fill_price = max(low, min(high, effective_fill_price))
+        if order_type == "LIMIT":
+            if side == "BUY":
+                effective_fill_price = min(limit_price, effective_fill_price)
+            else:
+                effective_fill_price = max(limit_price, effective_fill_price)
 
         fill_info = self.sm.mark_filled(order_id, price=effective_fill_price, quantity=qty)
 

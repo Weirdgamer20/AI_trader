@@ -62,13 +62,20 @@ def extract_chart_data(uploaded_file) -> dict[str, Any]:
         data = pytesseract.image_to_data(processed, output_type=pytesseract.Output.DICT, config="--psm 6")
         confidences = [int(c) for c in data.get("conf", []) if str(c).isdigit() and int(c) >= 0]
         mean_conf = round(sum(confidences) / len(confidences), 1) if confidences else 0.0
-    except Exception:
+        raw_text = pytesseract.image_to_string(processed, config="--psm 6").strip()
+        entities = parse_chart_entities(raw_text)
+        is_available = True
+        error_msg = None
+    except Exception as exc:
         mean_conf = 0.0
-
-    raw_text = pytesseract.image_to_string(processed, config="--psm 6").strip()
-    entities = parse_chart_entities(raw_text)
+        raw_text = ""
+        entities = {"prices": [], "timestamps": [], "currencies": []}
+        is_available = False
+        error_msg = f"Tesseract OCR runtime not available or failed: {exc}"
 
     return {
+        "is_available": is_available,
+        "error": error_msg,
         "raw_text": raw_text,
         "confidence_pct": mean_conf,
         "parsed_prices": entities["prices"],

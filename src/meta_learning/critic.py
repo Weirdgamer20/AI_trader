@@ -32,30 +32,44 @@ class IndependentStrategyCritic:
         """
         rejection_reasons = []
 
-        direction = forecast_projection.get("direction", "DOWN")
-        prob_up = forecast_projection.get("probability_up", 0.5)
-        expected_ret = forecast_projection.get("expected_return_pct", 0.0)
-        uncertainty_width = forecast_projection.get("uncertainty_width_pct", 0.0)
+        direction = forecast_projection.get("direction")
+        prob_up = forecast_projection.get("probability_up")
+        expected_ret = forecast_projection.get("expected_return_pct")
+        uncertainty_width = forecast_projection.get("uncertainty_width_pct")
 
-        # 1. Directional alignment
-        if side.upper() == "BUY":
-            if direction != "UP" or prob_up < self.min_model_confidence:
-                rejection_reasons.append(
-                    f"Model confidence ({prob_up*100:.1f}%) below minimum required {self.min_model_confidence*100:.1f}%"
-                )
-
-            # 2. Expected return vs Transaction costs hurdle
-            # CoinDCX roundtrip cost: 0.50% buy fee + 18% GST + 0.50% sell fee + 18% GST + 1% TDS ~ 2.18%
-            if expected_ret < self.min_expected_return_pct:
-                rejection_reasons.append(
-                    f"Expected return ({expected_ret*100:.2f}%) insufficient to clear roundtrip cost hurdle ({self.min_expected_return_pct*100:.2f}%)"
-                )
-
-        # 3. Forecast uncertainty check
-        if uncertainty_width > self.max_uncertainty_width_pct:
+        # P1-5: Require explicit, valid uncertainty estimate; never substitute zero
+        if uncertainty_width is None or not isinstance(uncertainty_width, (int, float)):
+            rejection_reasons.append("Missing or invalid forecast uncertainty estimate (fail-closed)")
+        elif uncertainty_width > self.max_uncertainty_width_pct:
             rejection_reasons.append(
                 f"Forecast uncertainty band width ({uncertainty_width*100:.2f}%) exceeds safety ceiling ({self.max_uncertainty_width_pct*100:.2f}%)"
             )
+
+        if expected_ret is None or not isinstance(expected_ret, (int, float)):
+            rejection_reasons.append("Missing expected return estimate")
+        if prob_up is None or not isinstance(prob_up, (int, float)):
+            rejection_reasons.append("Missing directional probability estimate")
+
+        # Dynamic roundtrip hurdle: 0.5% buy + 18% GST (0.09%) + 0.5% sell + 18% GST (0.09%) + 1.0% TDS + 0.3% slippage ~ 2.48%
+        cost_hurdle = 0.0248
+
+        # 1. Directional alignment & expected return check
+        side_norm = side.upper()
+        if side_norm == "BUY":
+            if direction != "UP" or (prob_up is not None and prob_up < self.min_model_confidence):
+                rejection_reasons.append(
+                    f"BUY directional confidence ({prob_up*100:.1f}%) below minimum required {self.min_model_confidence*100:.1f}%"
+                )
+            if expected_ret is not None and expected_ret < cost_hurdle:
+                rejection_reasons.append(
+                    f"Expected return ({expected_ret*100:.2f}%) insufficient to clear roundtrip cost hurdle ({cost_hurdle*100:.2f}%)"
+                )
+        elif side_norm == "SELL":
+            # For sell, expected return (or downside) should align with exiting
+            if direction == "UP" and prob_up is not None and prob_up > 0.70:
+                rejection_reasons.append(
+                    f"Strong upward forecast ({prob_up*100:.1f}%) conflicts with proposed discretionary SELL"
+                )
 
         # 4. Model consensus
         if model_agreement_pct < 0.65:

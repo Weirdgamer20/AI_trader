@@ -17,9 +17,9 @@ def test_paper_trading_execution_within_and_outside_candle_bounds(tmp_path):
     sm = ExecutionStateMachine(db=db, ledger=ledger, risk_engine=engine, emergency_system=emerg)
     trader = PaperTradingEngine(db=db, ledger=ledger, state_machine=sm)
 
-    # Propose buy order at ₹50,000 (stop loss ₹45,000)
+    # Propose buy order at ₹50,000 (stop loss ₹47,600 -> ~5% downside, within ₹10 (2%) risk limit)
     prop = sm.propose_order(
-        market_pair="I-BTC_INR", side="BUY", current_price=50000.0, proposed_stop_loss=45000.0,
+        market_pair="I-BTC_INR", side="BUY", current_price=50000.0, proposed_stop_loss=47600.0,
         bid_price=49990.0, ask_price=50010.0,
     )
     assert prop["success"] is True

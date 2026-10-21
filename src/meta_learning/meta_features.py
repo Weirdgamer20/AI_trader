@@ -22,11 +22,14 @@ class MetaFeatureExtractor:
         """
         if len(candle_df) < 15:
             return {
-                "volatility_regime": 0.01,
-                "trend_strength": 0.0,
-                "range_expansion": 0.0,
-                "volume_ratio": 1.0,
-                "learner_consensus": 0.5,
+                "status": "DATA_INSUFFICIENT",
+                "is_valid": False,
+                "volatility_regime": None,
+                "trend_strength": None,
+                "range_expansion": None,
+                "volume_ratio": None,
+                "learner_consensus": None,
+                "reason": f"Need at least 15 candles for regime extraction, got {len(candle_df)}",
             }
 
         close = candle_df["close"].to_numpy(dtype=float)

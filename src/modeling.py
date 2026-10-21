@@ -79,8 +79,10 @@ def fit_and_evaluate(raw: pd.DataFrame, output_dir: str = "models"):
         max_iter=180, learning_rate=.05, max_leaf_nodes=15,
         l2_regularization=1.0, random_state=42,
     )
-    regressor.fit(trainval[FEATURES], trainval["target_close"])
-    price_pred = regressor.predict(test[FEATURES])
+    # P1-1: Train on target_log_return rather than raw price to extrapolate correctly across price trends
+    regressor.fit(trainval[FEATURES], trainval["target_log_return"])
+    pred_log_ret = regressor.predict(test[FEATURES])
+    price_pred = test["close"].to_numpy(dtype=float) * np.exp(pred_log_ret)
     # Naive price baseline: next close equals current close.
     naive_pred = test["close"].to_numpy(dtype=float)
 
@@ -123,7 +125,7 @@ def fit_and_evaluate(raw: pd.DataFrame, output_dir: str = "models"):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     joblib.dump({"model": classifier, "features": FEATURES, "version": MODEL_VERSION, "name": best_name}, out / "direction_model.joblib")
-    joblib.dump({"model": regressor, "features": FEATURES, "version": MODEL_VERSION, "name": "hist_gradient_boosting_regressor"}, out / "price_model.joblib")
+    joblib.dump({"model": regressor, "features": FEATURES, "version": MODEL_VERSION, "name": "hist_gradient_boosting_log_return_regressor"}, out / "price_model.joblib")
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     test_results.to_csv(out / "test_predictions.csv", index=False)
     return metrics, test_results, classifier, regressor
@@ -149,14 +151,16 @@ def predict_next(raw: pd.DataFrame, classifier, regressor):
         raise ValueError("Not enough clean candles to generate a prediction.")
     latest = featured.iloc[[-1]]
     probability_up = float(classifier.predict_proba(latest[FEATURES])[0, 1])
-    predicted_close = float(regressor.predict(latest[FEATURES])[0])
+    predicted_log_ret = float(regressor.predict(latest[FEATURES])[0])
     last_close = float(latest["close"].iloc[0])
+    predicted_close = float(last_close * np.exp(predicted_log_ret))
     diff = predicted_close - last_close
     return {
         "last_close": last_close,
-        "predicted_next_close": predicted_close,
-        "predicted_change_inr": diff,
-        "predicted_change_pct": (diff / last_close) * 100,
+        "predicted_next_close": round(predicted_close, 2),
+        "predicted_change_inr": round(diff, 2),
+        "predicted_change_pct": round((diff / last_close) * 100, 4),
+        "predicted_log_return": round(predicted_log_ret, 6),
         "probability_up": probability_up,
         "direction": "UP" if probability_up >= .5 else "DOWN",
         "candle_time": str(latest["time"].iloc[0]),

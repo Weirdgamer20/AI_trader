@@ -49,6 +49,10 @@ class PluginSandbox:
     def register_plugin(self, manifest_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Validates plugin manifest, rejects dangerous permissions."""
         plugin_id = manifest_dict.get("plugin_id")
+        if not plugin_id or not isinstance(plugin_id, str) or not plugin_id.strip():
+            return {"success": False, "reason": "Invalid or missing plugin_id in manifest"}
+        plugin_id = plugin_id.strip()
+
         name = manifest_dict.get("name", "Unnamed Plugin")
         version = manifest_dict.get("version", "1.0.0")
         author = manifest_dict.get("author", "Unknown")
@@ -98,8 +102,21 @@ class PluginSandbox:
                 "error": f"Plugin crashed and was automatically isolated: {type(exc).__name__}: {exc}",
             }
 
-    def save_workspace_layout(self, workspace_name: str, layout_config: Dict[str, Any]) -> None:
+    def save_workspace_layout(self, workspace_name: str, layout_config: Dict[str, Any], config_path: str = "workspace_layout.json") -> None:
         self.workspaces[workspace_name] = layout_config
+        try:
+            from pathlib import Path
+            Path(config_path).write_text(json.dumps(self.workspaces, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
-    def get_workspace_layout(self, workspace_name: str) -> Dict[str, Any]:
+    def get_workspace_layout(self, workspace_name: str, config_path: str = "workspace_layout.json") -> Dict[str, Any]:
+        from pathlib import Path
+        p = Path(config_path)
+        if p.exists():
+            try:
+                loaded = json.loads(p.read_text(encoding="utf-8"))
+                self.workspaces.update(loaded)
+            except Exception:
+                pass
         return self.workspaces.get(workspace_name, self.workspaces["Default"])
