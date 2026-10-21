@@ -9,12 +9,26 @@ from .fee_tax_engine import FeeAndTaxEngine
 class PortfolioLedger:
     """
     Authoritative Portfolio Accounting and Double-Entry General Ledger.
-    Guarantees:
-    - True balanced double-entry journal postings (sum of debits == sum of credits).
-    - Strict per-order reservation tracking for cash and asset positions.
-    - Prevents duplicate fills via unique trade IDs.
-    - Explicit tracking of TDS Receivable asset separate from cash.
-    - Atomic execution across accounts, positions, orders, fills, and journal entries.
+    
+    ACCOUNTING CONVENTION SPECIFICATION:
+    1. Chart of Accounts:
+       - Asset Accounts (Debit Normal):
+         * CASH: Free, unencumbered INR available for orders/withdrawal.
+         * LOCKED_CASH: Cash segregated and reserved for specific pending BUY orders.
+         * HOLDINGS: Pure cost basis of crypto inventory (acquisition price * qty).
+         * TDS_RECEIVABLE: Asset credit for Section 194S 1% TDS withheld at source.
+       - Expense Accounts (Debit Normal):
+         * FEE_EXPENSE: Brokerage fees incurred on executed orders.
+         * GST_EXPENSE: 18% Goods & Services Tax levied on brokerage fees.
+       - Income / Equity Accounts (Credit Normal):
+         * INITIAL_CAPITAL: Seed capital reservation.
+         * REALIZED_PNL: Realized gains on asset sales (Gross Sale - Cost Basis).
+    
+    2. Master Invariant Equation:
+       Total Equity = CASH + LOCKED_CASH + (HOLDINGS + Unrealized P&L) + TDS_RECEIVABLE
+    
+    3. Balanced Journal Invariant:
+       Every financial mutation must satisfy: sum(Debits) == sum(Credits).
     """
     def __init__(self, db: DatabaseManager, fee_engine: FeeAndTaxEngine | None = None, account_id: str = "default_spot"):
         self.db = db
@@ -325,6 +339,7 @@ class PortfolioLedger:
         stop_loss_price: float | None = None,
         take_profit_price: float | None = None,
         idempotency_key: str | None = None,
+        status: str = "SUBMITTED",
     ) -> str:
         now_iso = datetime.now(timezone.utc).isoformat()
         with self.db.session() as conn:
@@ -337,11 +352,11 @@ class PortfolioLedger:
                     reserved_funds_inr, reserved_quantity,
                     planned_risk_inr, stop_loss_price, take_profit_price,
                     idempotency_key, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'PROPOSED', ?, ?, 0.0, 0.0, 0.0, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, 0.0, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id, client_order_id, self.account_id, market_pair, side,
-                    order_type, price, quantity, planned_risk_inr, stop_loss_price,
+                    order_type, status, price, quantity, planned_risk_inr, stop_loss_price,
                     take_profit_price, idempotency_key or str(uuid.uuid4()), now_iso, now_iso,
                 ),
             )
@@ -370,41 +385,74 @@ class PortfolioLedger:
         quantity: float,
         exchange_trade_id: str | None = None,
         is_maker: bool = False,
+        conn: Any | None = None,
     ) -> Dict[str, Any]:
         """
         Records a BUY fill atomically:
-        - Validates order state and remaining quantity.
-        - Deducts exact outlay from order's reserved funds and settles any remainder with available cash.
-        - Posts balanced double-entry journal entries.
+        - Validates numerical inputs (finite, strictly positive).
+        - Validates order state (SUBMITTED or PARTIAL).
+        - Idempotently ignores duplicate exchange_trade_id.
+        - Proportionally consumes cash reservation without releasing remaining quantity's reservation.
+        - Posts balanced double-entry journal postings reflecting actual locked cash vs free cash usage.
         """
+        import math
+        if not (isinstance(price, (int, float)) and math.isfinite(price) and price > 0):
+            raise ValueError(f"Price must be a finite, strictly positive number. Got {price}")
+        if not (isinstance(quantity, (int, float)) and math.isfinite(quantity) and quantity > 0):
+            raise ValueError(f"Quantity must be a finite, strictly positive number. Got {quantity}")
+
         now_iso = datetime.now(timezone.utc).isoformat()
         fill_id = str(uuid.uuid4())
-        trade_id = exchange_trade_id or f"fill-{uuid.uuid4().hex[:12]}"
         costs = self.fee_engine.calculate_buy_costs(price, quantity, is_maker)
         total_outlay = costs["total_outlay_inr"]
 
-        with self.db.session() as conn:
-            cur = conn.cursor()
+        def _execute_in_session(c: Any) -> Dict[str, Any]:
+            cur = c.cursor()
             # 1. Verify order state and remaining unfulfilled quantity
             cur.execute("SELECT status, quantity, filled_quantity, reserved_funds_inr FROM orders WHERE order_id = ?", (order_id,))
             order = cur.fetchone()
             if not order:
                 raise ValueError(f"Order {order_id} does not exist.")
 
-            if order["status"] not in ["SUBMITTED", "PARTIAL", "PROPOSED", "AUTHORIZED"]:
-                raise ValueError(f"Cannot fill order in status {order['status']}. Must be SUBMITTED or PARTIAL.")
+            if order["status"] not in ["SUBMITTED", "PARTIAL"]:
+                raise ValueError(f"Cannot record fill for order in state {order['status']}. Must be SUBMITTED or PARTIAL.")
 
-            remaining_qty = float(order["quantity"]) - float(order["filled_quantity"])
+            prev_filled = float(order["filled_quantity"])
+            tot_qty = float(order["quantity"])
+            remaining_qty = tot_qty - prev_filled
             if quantity > remaining_qty + 1e-8:
                 raise ValueError(f"Fill quantity {quantity} exceeds order remaining quantity {remaining_qty}")
 
-            # 2. Settle against reserved funds
-            reserved_cash = float(order["reserved_funds_inr"])
-            cash_settlement_locked = min(reserved_cash, total_outlay)
-            cash_settlement_extra = max(0.0, total_outlay - reserved_cash)
-            leftover_refund = max(0.0, reserved_cash - total_outlay)
+            trade_id = exchange_trade_id or f"paper-{order_id}-{round(prev_filled, 8)}+{round(quantity, 8)}"
 
-            # Insert Fill with UNIQUE exchange_trade_id constraint
+            # Duplicate fill idempotency check (P0-3)
+            cur.execute("SELECT fill_id, order_id, price, quantity, fee_inr, gst_on_fee_inr, net_proceeds_inr FROM fills WHERE exchange_trade_id = ?", (trade_id,))
+            existing_fill = cur.fetchone()
+            if existing_fill:
+                return {
+                    "fill_id": existing_fill["fill_id"],
+                    "trade_id": trade_id,
+                    "duplicate": True,
+                    "status": "ALREADY_PROCESSED",
+                    "costs": costs,
+                }
+
+            # 2. Settle against reserved funds proportionally (P0-2)
+            reserved_cash = float(order["reserved_funds_inr"])
+            is_final_fill = (prev_filled + quantity) >= (tot_qty - 1e-8)
+
+            if is_final_fill:
+                reserved_for_fill = reserved_cash
+                remaining_reserved_funds = 0.0
+            else:
+                reserved_for_fill = min(reserved_cash, round(reserved_cash * (quantity / remaining_qty), 4))
+                remaining_reserved_funds = round(reserved_cash - reserved_for_fill, 4)
+
+            consumed_from_locked = min(reserved_for_fill, total_outlay)
+            extra_cash_needed = max(0.0, total_outlay - reserved_for_fill)
+            refund_from_portion = max(0.0, reserved_for_fill - total_outlay)
+
+            # Insert Fill
             cur.execute(
                 """
                 INSERT INTO fills (
@@ -429,19 +477,19 @@ class PortfolioLedger:
                     updated_at = ?
                 WHERE account_id = ?
                 """,
-                (reserved_cash, cash_settlement_extra, leftover_refund, now_iso, self.account_id),
+                (reserved_for_fill, extra_cash_needed, refund_from_portion, now_iso, self.account_id),
             )
 
-            # Update order remaining reserved funds
+            # Update order remaining reserved funds and filled quantity
             cur.execute(
                 """
                 UPDATE orders 
                 SET filled_quantity = filled_quantity + ?,
-                    reserved_funds_inr = 0.0,
+                    reserved_funds_inr = ?,
                     updated_at = ?
                 WHERE order_id = ?
                 """,
-                (quantity, now_iso, order_id),
+                (quantity, remaining_reserved_funds, now_iso, order_id),
             )
 
             # Update position
@@ -475,21 +523,25 @@ class PortfolioLedger:
                     (str(uuid.uuid4()), self.account_id, market_pair, quantity, price, costs["gross_value_inr"], price, now_iso),
                 )
 
-            # Post balanced double-entry journal entries:
-            # Debit HOLDINGS: gross_value
-            # Debit FEE_EXPENSE: brokerage_fee
-            # Debit GST_EXPENSE: gst_on_fee
-            # Credit CASH: total_outlay
+            # Post balanced double-entry journal entries (P0-4):
+            postings = [
+                ("HOLDINGS", costs["gross_value_inr"], 0.0, f"Acquisition of {quantity} {market_pair}"),
+                ("FEE_EXPENSE", costs["brokerage_fee_inr"], 0.0, f"Brokerage fee for {order_id}"),
+                ("GST_EXPENSE", costs["gst_on_fee_inr"], 0.0, f"GST on brokerage for {order_id}"),
+            ]
+            if consumed_from_locked > 0:
+                postings.append(("LOCKED_CASH", 0.0, consumed_from_locked, f"Locked funds consumed for {order_id}"))
+            if extra_cash_needed > 0:
+                postings.append(("CASH", 0.0, extra_cash_needed, f"Additional cash paid for {order_id}"))
+            if refund_from_portion > 0:
+                postings.append(("CASH", refund_from_portion, 0.0, f"Unused reservation refund for {order_id}"))
+                postings.append(("LOCKED_CASH", 0.0, refund_from_portion, f"Release locked funds refund for {order_id}"))
+
             tx_id = str(uuid.uuid4())
             self._post_journal(
                 cur=cur,
                 tx_id=tx_id,
-                postings=[
-                    ("HOLDINGS", costs["gross_value_inr"], 0.0, f"Acquisition of {quantity} {market_pair}"),
-                    ("FEE_EXPENSE", costs["brokerage_fee_inr"], 0.0, f"Brokerage fee for {order_id}"),
-                    ("GST_EXPENSE", costs["gst_on_fee_inr"], 0.0, f"GST on brokerage for {order_id}"),
-                    ("CASH", 0.0, total_outlay, f"Cash outlay for {quantity} {market_pair}"),
-                ],
+                postings=postings,
                 ref_id=fill_id,
                 timestamp=now_iso,
             )
@@ -510,8 +562,13 @@ class PortfolioLedger:
                     f"Buy {quantity} {market_pair} @ {price}", now_iso,
                 ),
             )
+            return {"fill_id": fill_id, "trade_id": trade_id, "costs": costs, "duplicate": False}
 
-        return {"fill_id": fill_id, "trade_id": trade_id, "costs": costs}
+        if conn is not None:
+            return _execute_in_session(conn)
+        else:
+            with self.db.session() as s:
+                return _execute_in_session(s)
 
     def record_sell_fill(
         self,
@@ -521,28 +578,60 @@ class PortfolioLedger:
         quantity: float,
         exchange_trade_id: str | None = None,
         is_maker: bool = False,
+        conn: Any | None = None,
     ) -> Dict[str, Any]:
         """
         Records a SELL fill atomically:
-        - Reconciles held position, preventing overselling.
-        - Credits net cash proceeds and records Section 194S TDS as an asset credit.
+        - Validates numerical inputs (finite, strictly positive).
+        - Validates order state (SUBMITTED or PARTIAL).
+        - Idempotently ignores duplicate exchange_trade_id.
+        - Verifies and reduces position and reserved asset quantity.
+        - Credits net cash proceeds and records Section 194S TDS as asset credit.
         - Calculates Section 115BBH VDA tax.
         - Posts balanced double-entry journal.
         """
+        import math
+        if not (isinstance(price, (int, float)) and math.isfinite(price) and price > 0):
+            raise ValueError(f"Price must be a finite, strictly positive number. Got {price}")
+        if not (isinstance(quantity, (int, float)) and math.isfinite(quantity) and quantity > 0):
+            raise ValueError(f"Quantity must be a finite, strictly positive number. Got {quantity}")
+
         now_iso = datetime.now(timezone.utc).isoformat()
         fill_id = str(uuid.uuid4())
-        trade_id = exchange_trade_id or f"fill-{uuid.uuid4().hex[:12]}"
 
-        with self.db.session() as conn:
-            cur = conn.cursor()
+        def _execute_in_session(c: Any) -> Dict[str, Any]:
+            cur = c.cursor()
             # Verify order state
             cur.execute("SELECT status, quantity, filled_quantity, reserved_quantity FROM orders WHERE order_id = ?", (order_id,))
             order = cur.fetchone()
             if not order:
                 raise ValueError(f"Order {order_id} does not exist.")
 
-            if order["status"] not in ["SUBMITTED", "PARTIAL", "PROPOSED", "AUTHORIZED"]:
+            if order["status"] not in ["SUBMITTED", "PARTIAL"]:
                 raise ValueError(f"Cannot fill order in status {order['status']}. Must be SUBMITTED or PARTIAL.")
+
+            prev_filled = float(order["filled_quantity"])
+            tot_qty = float(order["quantity"])
+            remaining_qty = tot_qty - prev_filled
+            if quantity > remaining_qty + 1e-8:
+                raise ValueError(f"Fill quantity {quantity} exceeds order remaining quantity {remaining_qty}")
+
+            reserved_qty = float(order["reserved_quantity"])
+            if reserved_qty > 0 and quantity > reserved_qty + 1e-8:
+                raise ValueError(f"Fill quantity {quantity} exceeds order reserved quantity {reserved_qty}")
+
+            trade_id = exchange_trade_id or f"paper-{order_id}-{round(prev_filled, 8)}+{round(quantity, 8)}"
+
+            # Duplicate fill idempotency check (P0-3)
+            cur.execute("SELECT fill_id, order_id, price, quantity, fee_inr, gst_on_fee_inr, net_proceeds_inr FROM fills WHERE exchange_trade_id = ?", (trade_id,))
+            existing_fill = cur.fetchone()
+            if existing_fill:
+                return {
+                    "fill_id": existing_fill["fill_id"],
+                    "trade_id": trade_id,
+                    "duplicate": True,
+                    "status": "ALREADY_PROCESSED",
+                }
 
             # Verify position exists and has sufficient quantity
             cur.execute(
@@ -600,7 +689,7 @@ class PortfolioLedger:
                 ),
             )
 
-            # Update Order filled quantity
+            # Update Order filled quantity and reduce reserved quantity
             cur.execute(
                 """
                 UPDATE orders 
@@ -613,9 +702,9 @@ class PortfolioLedger:
             )
 
             # Update Position
-            remaining_qty = max(0.0, pos_qty - quantity)
-            remaining_cost = cost_basis_per_unit * remaining_qty
-            is_open = 1 if remaining_qty > 1e-8 else 0
+            remaining_qty_pos = max(0.0, pos_qty - quantity)
+            remaining_cost = cost_basis_per_unit * remaining_qty_pos
+            is_open = 1 if remaining_qty_pos > 1e-8 else 0
             cur.execute(
                 """
                 UPDATE positions 
@@ -628,7 +717,7 @@ class PortfolioLedger:
                 WHERE position_id = ?
                 """,
                 (
-                    remaining_qty, quantity, remaining_cost, sell_results["economic_pnl_inr"],
+                    remaining_qty_pos, quantity, remaining_cost, sell_results["economic_pnl_inr"],
                     is_open, now_iso, pos["position_id"],
                 ),
             )
@@ -654,15 +743,8 @@ class PortfolioLedger:
             )
 
             # Post balanced double-entry journal entries:
-            # Debit CASH: net_cash_received
-            # Debit TDS_RECEIVABLE: tds_withheld
-            # Debit FEE_EXPENSE: fee
-            # Debit GST_EXPENSE: gst
-            # Debit/Credit REALIZED_PNL: economic_pnl balance
-            # Credit HOLDINGS: sold_cost_basis
             sold_cost_basis = round(cost_basis_per_unit * quantity, 4)
             tx_id = str(uuid.uuid4())
-            # Accounting Gain on asset = Gross Sale - Sold Cost Basis
             asset_gain = round(sell_results["gross_sale_inr"] - sold_cost_basis, 4)
             gain_postings = (
                 [("REALIZED_PNL", abs(asset_gain), 0.0, "Loss on asset sale")]
@@ -670,8 +752,6 @@ class PortfolioLedger:
                 else [("REALIZED_PNL", 0.0, asset_gain, "Gain on asset sale")]
             )
 
-            # Debits: Net cash + TDS withheld + Brokerage fee + GST on fee == Gross Sale
-            # Credits: Sold asset cost basis + Asset gain == Gross Sale
             self._post_journal(
                 cur=cur,
                 tx_id=tx_id,
@@ -701,5 +781,96 @@ class PortfolioLedger:
                     f"Sell {quantity} {market_pair} @ {price}", now_iso,
                 ),
             )
+            return {"fill_id": fill_id, "trade_id": trade_id, "sell_results": sell_results, "duplicate": False}
 
-        return {"fill_id": fill_id, "trade_id": trade_id, "sell_results": sell_results}
+        if conn is not None:
+            return _execute_in_session(conn)
+        else:
+            with self.db.session() as s:
+                return _execute_in_session(s)
+
+    def reconcile_operational_with_journal(self, account_id: str | None = None) -> Dict[str, Any]:
+        """
+        Rigorously reconciles operational table balances (accounts, positions)
+        against double-entry general ledger journal entries (P0-4).
+        """
+        acc_id = account_id or self.account_id
+        with self.db.session() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT available_balance, locked_balance, tds_receivable_inr FROM accounts WHERE account_id = ?", (acc_id,))
+            acc = cur.fetchone()
+            if not acc:
+                raise ValueError(f"Account {acc_id} not found.")
+
+            cur.execute(
+                """
+                SELECT account_name,
+                       SUM(debit_inr) as total_debits,
+                       SUM(credit_inr) as total_credits
+                FROM journal_entries
+                WHERE account_id = ?
+                GROUP BY account_name
+                """,
+                (acc_id,),
+            )
+            journal_rows = {r["account_name"]: (float(r["total_debits"] or 0.0), float(r["total_credits"] or 0.0)) for r in cur.fetchall()}
+
+            def net_asset(name: str) -> float:
+                deb, cred = journal_rows.get(name, (0.0, 0.0))
+                return round(deb - cred, 4)
+
+            journal_cash = net_asset("CASH")
+            journal_locked = net_asset("LOCKED_CASH")
+            journal_tds = net_asset("TDS_RECEIVABLE")
+            journal_holdings = net_asset("HOLDINGS")
+
+            op_cash = round(float(acc["available_balance"]), 4)
+            op_locked = round(float(acc["locked_balance"]), 4)
+            op_tds = round(float(acc["tds_receivable_inr"]), 4)
+
+            cur.execute("SELECT SUM(cost_basis_inr) FROM positions WHERE account_id = ? AND is_open = 1", (acc_id,))
+            pos_row = cur.fetchone()
+            op_holdings = round(float(pos_row[0] or 0.0), 4)
+
+            cur.execute("SELECT SUM(debit_inr), SUM(credit_inr) FROM journal_entries WHERE account_id = ?", (acc_id,))
+            tot_row = cur.fetchone()
+            tot_deb = round(float(tot_row[0] or 0.0), 4)
+            tot_cred = round(float(tot_row[1] or 0.0), 4)
+            is_balanced = abs(tot_deb - tot_cred) < 1e-4
+
+            cash_match = abs(journal_cash - op_cash) < 1e-4
+            locked_match = abs(journal_locked - op_locked) < 1e-4
+            tds_match = abs(journal_tds - op_tds) < 1e-4
+            holdings_match = abs(journal_holdings - op_holdings) < 1e-4
+
+            discrepancies = []
+            if not is_balanced:
+                discrepancies.append(f"Journal unbalanced: debits={tot_deb} != credits={tot_cred}")
+            if not cash_match:
+                discrepancies.append(f"CASH mismatch: journal={journal_cash} vs operational={op_cash}")
+            if not locked_match:
+                discrepancies.append(f"LOCKED_CASH mismatch: journal={journal_locked} vs operational={op_locked}")
+            if not tds_match:
+                discrepancies.append(f"TDS_RECEIVABLE mismatch: journal={journal_tds} vs operational={op_tds}")
+            if not holdings_match:
+                discrepancies.append(f"HOLDINGS mismatch: journal={journal_holdings} vs operational={op_holdings}")
+
+            return {
+                "reconciled": len(discrepancies) == 0,
+                "is_journal_balanced": is_balanced,
+                "discrepancies": discrepancies,
+                "journal": {
+                    "cash": journal_cash,
+                    "locked_cash": journal_locked,
+                    "tds_receivable": journal_tds,
+                    "holdings": journal_holdings,
+                    "total_debits": tot_deb,
+                    "total_credits": tot_cred,
+                },
+                "operational": {
+                    "cash": op_cash,
+                    "locked_cash": op_locked,
+                    "tds_receivable": op_tds,
+                    "holdings": op_holdings,
+                },
+            }

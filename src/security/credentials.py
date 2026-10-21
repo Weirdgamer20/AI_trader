@@ -8,6 +8,7 @@ SECRET_REGEX = re.compile(
     r"(?i)(api[_-]?key|private[_-]?key|[a-z0-9_-]*key|secret|token|password|auth|bearer)\s*[:=]\s*([^\s,;\"']+)"
 )
 BOT_TOKEN_REGEX = re.compile(r"bot[0-9]{8,}:[a-zA-Z0-9_-]{20,}")
+TELEGRAM_URL_REGEX = re.compile(r"(https?://api\.telegram\.org/bot)[0-9]{8,}:[a-zA-Z0-9_-]{20,}")
 
 class CredentialVault:
     """
@@ -27,18 +28,23 @@ class CredentialVault:
         """Redacts any API keys, bearer tokens, or password-like strings."""
         if not text:
             return ""
-        sanitized = SECRET_REGEX.sub(r"\1: [REDACTED]", str(text))
+        sanitized = TELEGRAM_URL_REGEX.sub(r"\1[REDACTED_BOT_TOKEN]", str(text))
         sanitized = BOT_TOKEN_REGEX.sub("[REDACTED_BOT_TOKEN]", sanitized)
+        sanitized = SECRET_REGEX.sub(r"\1: [REDACTED]", sanitized)
         return sanitized
 
     @classmethod
     def redact_data(cls, data: Any) -> Any:
         """Recursively redacts sensitive keys from dictionaries, lists, tuples, and strings."""
-        sensitive_key_terms = {"secret", "api_key", "token", "password", "auth", "private_key", "credentials"}
+        sensitive_normalized_terms = {
+            "secret", "apikey", "token", "password", "auth",
+            "privatekey", "credential", "credentials", "accesskey", "secretkey", "bearer"
+        }
         if isinstance(data, dict):
             redacted = {}
             for k, v in data.items():
-                if any(term in str(k).lower() for term in sensitive_key_terms):
+                norm_k = re.sub(r"[_\-\s]", "", str(k).lower())
+                if any(term in norm_k for term in sensitive_normalized_terms):
                     redacted[k] = cls.SECRET_MASK
                 else:
                     redacted[k] = cls.redact_data(v)

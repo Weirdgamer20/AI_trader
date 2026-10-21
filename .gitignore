@@ -13,3 +13,4 @@ models/*.csv
 .streamlit/
 data/*.db
 data/*.db-*
+*.bak*

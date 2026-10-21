@@ -70,7 +70,13 @@
         if (data.uncertainty) document.getElementById('hud-uncertainty').textContent = data.uncertainty;
         if (data.tags && Array.isArray(data.tags)) {
           const tagsContainer = document.getElementById('hud-tags');
-          tagsContainer.innerHTML = data.tags.map(t => `<span class="hud-tag">${t}</span>`).join(' ');
+          tagsContainer.textContent = '';
+          data.tags.forEach(t => {
+            const span = document.createElement('span');
+            span.className = 'hud-tag';
+            span.textContent = String(t);
+            tagsContainer.appendChild(span);
+          });
         }
       } else {
         document.getElementById('hud-signal').textContent = 'LOCAL API ERROR';

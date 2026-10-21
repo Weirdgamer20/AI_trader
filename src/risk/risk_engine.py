@@ -50,9 +50,13 @@ class DeterministicRiskEngine:
         bid_price: float | None = None,
         ask_price: float | None = None,
         forecast_uncertainty: float = 0.0,
+        require_order_book: bool = False,
     ) -> Dict[str, Any]:
         """
-        Validates proposed order against strict deterministic risk rules.
+        Validates proposed order against strict deterministic risk rules:
+        - Strict 2.0% risk cap and remaining affordable loss ceiling budget (P0-6).
+        - Accounts for existing positions AND pending authorized/submitted BUY orders (P1-1).
+        - Validates order book spread and bid/ask integrity (P1-2).
         """
         # 1. Validate Side strictly
         normalized_side = str(side).strip().upper()
@@ -105,12 +109,12 @@ class DeterministicRiskEngine:
                 "estimated_total_cost_inr": 0.0,
             }
 
-        # 4. Check Bid/Ask Spread (Reject missing, crossed, or excessive spread)
-        if bid_price is not None or ask_price is not None:
+        # 4. Check Bid/Ask Spread (Reject missing, crossed, or excessive spread) (P1-2)
+        if require_order_book or (bid_price is not None or ask_price is not None):
             if bid_price is None or ask_price is None or bid_price <= 0 or ask_price <= 0:
                 return {
                     "approved": False,
-                    "rejection_reason": "Order book integrity failure: Missing or non-positive bid/ask prices",
+                    "rejection_reason": "Order book integrity failure: Missing or non-positive bid/ask prices required for execution",
                     "planned_risk_inr": 0.0,
                     "quantity": 0.0,
                     "position_notional_inr": 0.0,
@@ -141,14 +145,41 @@ class DeterministicRiskEngine:
         current_capital = account["total_equity_inr"]
         available_cash = account["available_balance_inr"]
 
+        # P1-1: Account for existing open positions and pending BUY orders
+        with self.ledger.db.session() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT market_pair, SUM(quantity * price) as pending_notional, COUNT(*) as pending_count
+                FROM orders
+                WHERE account_id = ? AND status IN ('AUTHORIZED', 'SUBMITTED', 'PARTIAL') AND side = 'BUY'
+                GROUP BY market_pair
+                """,
+                (self.ledger.account_id,),
+            )
+            pending_orders = {r["market_pair"]: (float(r["pending_notional"] or 0.0), int(r["pending_count"] or 0)) for r in cur.fetchall()}
+
+            cur.execute("SELECT DISTINCT market_pair FROM positions WHERE account_id = ? AND is_open = 1", (self.ledger.account_id,))
+            open_pos_pairs = {r[0] for r in cur.fetchall()}
+            all_active_pairs = open_pos_pairs.union(set(pending_orders.keys()))
+
+            cur.execute(
+                "SELECT quantity, current_price FROM positions WHERE account_id = ? AND market_pair = ? AND is_open = 1",
+                (self.ledger.account_id, market_pair),
+            )
+            pos_cur = cur.fetchone()
+            cur_pos_val = float(pos_cur["quantity"] * pos_cur["current_price"]) if pos_cur else 0.0
+            pending_coin_notional = pending_orders.get(market_pair, (0.0, 0))[0]
+            existing_coin_exposure = cur_pos_val + pending_coin_notional
+
         # ==========================================
         # BUY ORDER VALIDATION & POSITION SIZING
         # ==========================================
         if normalized_side == "BUY":
-            if account["open_positions_count"] >= self.params.max_open_positions:
+            if market_pair not in all_active_pairs and len(all_active_pairs) >= self.params.max_open_positions:
                 return {
                     "approved": False,
-                    "rejection_reason": f"Maximum concurrent positions ({self.params.max_open_positions}) reached",
+                    "rejection_reason": f"Maximum concurrent positions/slots ({self.params.max_open_positions}) reached including pending orders",
                     "planned_risk_inr": 0.0,
                     "quantity": 0.0,
                     "position_notional_inr": 0.0,
@@ -171,7 +202,7 @@ class DeterministicRiskEngine:
                 raw_downside_pct + self.params.slippage_buffer_pct + self.params.fee_buffer_pct + (0.5 * forecast_uncertainty)
             )
 
-            # Strict 2.0% planned risk cap
+            # Strict 2.0% planned risk cap AND remaining loss ceiling budget (P0-6)
             hard_max_risk_inr = round(current_capital * self.params.max_risk_per_trade_pct, 4)
             allowed_planned_risk_inr = min(hard_max_risk_inr, ceiling_status["remaining_budget_inr"])
 
@@ -188,18 +219,33 @@ class DeterministicRiskEngine:
             # Sizing formula: Notional = Planned Risk / Downside %
             desired_notional = allowed_planned_risk_inr / effective_downside_pct
             max_coin_allocation = current_capital * self.params.max_portfolio_allocation_per_coin_pct
-            allowed_notional = min(desired_notional, max_coin_allocation, available_cash)
+            remaining_coin_budget = max(0.0, max_coin_allocation - existing_coin_exposure)
+            if remaining_coin_budget <= 0:
+                return {
+                    "approved": False,
+                    "rejection_reason": (
+                        f"Maximum portfolio allocation ({self.params.max_portfolio_allocation_per_coin_pct*100:.1f}%) "
+                        f"for coin {market_pair} exceeded (existing exposure ₹{existing_coin_exposure:.2f} >= max ₹{max_coin_allocation:.2f})"
+                    ),
+                    "planned_risk_inr": 0.0,
+                    "quantity": 0.0,
+                    "position_notional_inr": 0.0,
+                    "estimated_total_cost_inr": 0.0,
+                }
 
-            # Check minimum exchange order constraint
+            allowed_notional = min(desired_notional, remaining_coin_budget, available_cash)
+
+            # Check minimum exchange order constraint (P0-6)
             if allowed_notional < self.params.min_order_value_inr:
-                # Invariant: NEVER permit minimum order size if its risk exceeds strict 2.0% limit
                 implied_risk = self.params.min_order_value_inr * effective_downside_pct
-                if implied_risk > hard_max_risk_inr:
+                max_tolerable_risk = min(hard_max_risk_inr, allowed_planned_risk_inr)
+                if implied_risk > max_tolerable_risk:
                     return {
                         "approved": False,
                         "rejection_reason": (
                             f"Order rejected: Minimum order value ₹{self.params.min_order_value_inr} would incur "
-                            f"planned risk of ₹{implied_risk:.2f}, strictly exceeding the 2% hard risk limit of ₹{hard_max_risk_inr:.2f}."
+                            f"planned risk of ₹{implied_risk:.2f}, strictly exceeding the 2% hard risk limit of ₹{hard_max_risk_inr:.2f} "
+                            f"(allowable limit ₹{max_tolerable_risk:.2f}, remaining loss budget ₹{ceiling_status['remaining_budget_inr']:.2f})."
                         ),
                         "planned_risk_inr": round(implied_risk, 2),
                         "quantity": 0.0,
@@ -215,17 +261,30 @@ class DeterministicRiskEngine:
                         "position_notional_inr": 0.0,
                         "estimated_total_cost_inr": 0.0,
                     }
+                if self.params.min_order_value_inr > remaining_coin_budget:
+                    return {
+                        "approved": False,
+                        "rejection_reason": f"Minimum order value ₹{self.params.min_order_value_inr} exceeds remaining coin allocation budget ₹{remaining_coin_budget:.2f}",
+                        "planned_risk_inr": 0.0,
+                        "quantity": 0.0,
+                        "position_notional_inr": 0.0,
+                        "estimated_total_cost_inr": 0.0,
+                    }
                 allowed_notional = self.params.min_order_value_inr
 
             quantity = round(allowed_notional / current_price, 8)
             final_notional = round(quantity * current_price, 4)
             final_planned_risk = round(final_notional * effective_downside_pct, 4)
 
-            # Absolute final assertion: Planned risk CANNOT exceed hard limit
-            if final_planned_risk > hard_max_risk_inr + 1e-4:
+            # Absolute final assertion: Planned risk CANNOT exceed either hard limit or remaining budget (P0-6)
+            max_tolerable_risk = min(hard_max_risk_inr, allowed_planned_risk_inr)
+            if final_planned_risk > max_tolerable_risk + 1e-4:
                 return {
                     "approved": False,
-                    "rejection_reason": f"Planned risk ₹{final_planned_risk:.2f} strictly exceeds hard 2% limit of ₹{hard_max_risk_inr:.2f}",
+                    "rejection_reason": (
+                        f"Planned risk ₹{final_planned_risk:.2f} strictly exceeds the 2% hard risk limit of ₹{hard_max_risk_inr:.2f} "
+                        f"(allowable limit ₹{max_tolerable_risk:.2f}, remaining loss budget ₹{ceiling_status['remaining_budget_inr']:.2f})."
+                    ),
                     "planned_risk_inr": final_planned_risk,
                     "quantity": 0.0,
                     "position_notional_inr": 0.0,

@@ -78,6 +78,14 @@ def _normalize_candles(payload: Any, pair: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def normalize_pair_symbol(pair: str) -> str:
+    """Normalizes exchange pair codes (e.g., 'B-BTC_INR', 'I-BTC_INR', 'BTC_INR') to canonical symbol."""
+    p = str(pair).strip().upper()
+    if p.startswith(("B-", "I-")):
+        p = p[2:]
+    return p.replace("-", "").replace("_", "")
+
+
 def fetch_candles(
     pair: str | None = None,
     start_date: str = "2018-10-18",
@@ -101,6 +109,24 @@ def fetch_candles(
     existing_df = None
     if resume_path:
         target_file = Path(resume_path)
+        manifest_path = Path(f"{resume_path}.manifest.json")
+        if manifest_path.exists():
+            import json
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest = json.load(f)
+                manifest_pair = manifest.get("pair")
+                if manifest_pair and pair:
+                    if normalize_pair_symbol(manifest_pair) != normalize_pair_symbol(pair):
+                        raise ValueError(
+                            f"Dataset resume rejected: Manifest pair '{manifest_pair}' does not match requested pair '{pair}'. "
+                            "Cross-pair data contamination strictly prevented."
+                        )
+            except ValueError:
+                raise
+            except Exception:
+                pass
+
         if target_file.exists() and target_file.stat().st_size > 0:
             try:
                 loaded = pd.read_csv(target_file, parse_dates=["time"])
@@ -213,12 +239,34 @@ def fetch_candles(
     return combined
 
 
-def save_candles(df: pd.DataFrame, path: str = "data/raw/btc_inr_15m.csv") -> None:
+def get_dataset_path(pair: str, interval: str = INTERVAL, base_dir: str = "data/raw") -> Path:
     from pathlib import Path
+    slug = pair.lower().replace("-", "_").replace("/", "_")
+    return Path(base_dir) / f"{slug}_{interval}.csv"
+
+
+def save_candles(df: pd.DataFrame, path: str = "data/raw/btc_inr_15m.csv", pair: str | None = None, interval: str = INTERVAL) -> None:
+    from pathlib import Path
+    import json
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(target, index=False)
+
+    resolved_pair = pair or df.attrs.get("pair")
+    manifest_file = Path(f"{path}.manifest.json")
+    manifest_data = {
+        "pair": resolved_pair,
+        "interval": interval,
+        "source": "CoinDCX",
+        "schema_version": 1,
+        "row_count": len(df),
+        "first_candle": str(df["time"].min()) if not df.empty and "time" in df.columns else None,
+        "last_candle": str(df["time"].max()) if not df.empty and "time" in df.columns else None,
+        "updated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2)
 
 
 def data_quality_report(df: pd.DataFrame) -> dict[str, object]:

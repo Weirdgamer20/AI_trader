@@ -54,8 +54,12 @@ class MultiHorizonForecaster:
             req_cols = FEATURES + [
                 f"target_log_ret_{h}", f"target_high_ratio_{h}", f"target_low_ratio_{h}", f"target_dir_{h}"
             ]
-            clean_train = df.iloc[:train_end].dropna(subset=req_cols)
-            clean_calib = df.iloc[train_end:calib_end].dropna(subset=req_cols)
+            # P1-8: Purge the last h rows from train and calib partitions to prevent target leakage across split boundaries
+            train_purge_end = max(0, train_end - h)
+            calib_purge_end = max(train_end, calib_end - h)
+
+            clean_train = df.iloc[:train_purge_end].dropna(subset=req_cols)
+            clean_calib = df.iloc[train_end:calib_purge_end].dropna(subset=req_cols)
             clean_test = df.iloc[calib_end:].dropna(subset=req_cols)
 
             if len(clean_train) < 50 or len(clean_calib) < 20:
@@ -82,8 +86,7 @@ class MultiHorizonForecaster:
             self.models_low[h] = m_low
             self.models_dir[h] = m_dir
 
-            # P1-2: Calibrate 90% interval on separate out-of-sample calibration split
-            # Central 90% interval requires 5th and 95th percentiles (covering 90% of distribution)
+            # Calibrate 90% interval on separate out-of-sample calibration split
             calib_pred_ret = m_close.predict(clean_calib[FEATURES])
             calib_pred_close = clean_calib["close"] * np.exp(calib_pred_ret)
             calib_residuals = (clean_calib[f"target_close_{h}"] - calib_pred_close) / calib_pred_close
@@ -93,7 +96,7 @@ class MultiHorizonForecaster:
             self.residuals_p05[h] = p05
             self.residuals_p95[h] = p95
 
-            # Test empirical coverage on untouched final test split
+            # Test empirical coverage on untouched final test split (P1-9)
             if len(clean_test) > 0:
                 test_pred_ret = m_close.predict(clean_test[FEATURES])
                 test_pred_close = clean_test["close"] * np.exp(test_pred_ret)
@@ -108,9 +111,14 @@ class MultiHorizonForecaster:
                 eval_metrics[f"h{h}_mae"] = round(test_mae, 2)
                 eval_metrics[f"h{h}_test_mae"] = round(test_mae, 2)
                 eval_metrics[f"h{h}_empirical_coverage_90"] = round(coverage, 4)
+                eval_metrics[f"h{h}_status"] = "EVALUATED"
             else:
-                self.empirical_coverage_90[h] = 0.90
-                eval_metrics[f"h{h}_mae"] = 0.0
+                # Never fabricate coverage or zero error when test split is empty (P1-9)
+                self.empirical_coverage_90[h] = None
+                eval_metrics[f"h{h}_mae"] = None
+                eval_metrics[f"h{h}_test_mae"] = None
+                eval_metrics[f"h{h}_empirical_coverage_90"] = None
+                eval_metrics[f"h{h}_status"] = "DATA_INSUFFICIENT"
 
         if not self.models_close:
             raise RuntimeError("Failed to fit forecaster on any horizon.")
@@ -132,6 +140,10 @@ class MultiHorizonForecaster:
             if h not in self.models_close:
                 continue
 
+            # P1-10: Require fitted model and valid calibration artifact for this horizon
+            has_calib = (h in self.residuals_p05) and (h in self.residuals_p95)
+            is_tradable = has_calib
+
             pred_log_ret = float(self.models_close[h].predict(latest_row[FEATURES])[0])
             pred_close = float(current_close * np.exp(pred_log_ret))
 
@@ -151,14 +163,21 @@ class MultiHorizonForecaster:
             lower_wick = max(0.0, min(current_close, pred_close) - pred_low)
 
             # Uncertainty interval (90% calibrated from 5th to 95th percentiles)
-            band_low = max(0.01, pred_close * (1.0 + self.residuals_p05.get(h, -0.02)))
-            band_high = max(band_low, pred_close * (1.0 + self.residuals_p95.get(h, 0.02)))
-            uncertainty_width_pct = (band_high - band_low) / pred_close
+            if has_calib:
+                band_low = max(0.01, pred_close * (1.0 + self.residuals_p05[h]))
+                band_high = max(band_low, pred_close * (1.0 + self.residuals_p95[h]))
+                uncertainty_width_pct = (band_high - band_low) / pred_close
+                uncertainty_calibrated = True
+            else:
+                band_low = None
+                band_high = None
+                uncertainty_width_pct = None
+                uncertainty_calibrated = False
 
             expected_return_pct = (pred_close - current_close) / current_close
             downside_risk_pct = max(0.005, (current_close - pred_low) / current_close)
 
-            projections.append({
+            proj = {
                 "horizon_candles": h,
                 "horizon_minutes": h * 15,
                 "predicted_close": round(pred_close, 2),
@@ -171,11 +190,16 @@ class MultiHorizonForecaster:
                 "probability_up": round(prob_up, 4),
                 "expected_return_pct": round(expected_return_pct, 4),
                 "downside_risk_pct": round(downside_risk_pct, 4),
-                "uncertainty_band_low": round(band_low, 2),
-                "uncertainty_band_high": round(band_high, 2),
-                "uncertainty_width_pct": round(uncertainty_width_pct, 4),
-                "measured_90_coverage": self.empirical_coverage_90.get(h, 0.90),
-            })
+                "is_tradable": is_tradable,
+                "uncertainty_calibrated": uncertainty_calibrated,
+                "measured_90_coverage": self.empirical_coverage_90.get(h),
+            }
+            if band_low is not None and band_high is not None:
+                proj["uncertainty_band_low"] = round(band_low, 2)
+                proj["uncertainty_band_high"] = round(band_high, 2)
+                proj["uncertainty_width_pct"] = round(uncertainty_width_pct, 4)
+
+            projections.append(proj)
 
         return {
             "current_price": current_close,

@@ -52,8 +52,35 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def _ensure_column(self, cur: sqlite3.Cursor, table: str, column: str, col_def: str) -> None:
+        cur.execute(f"PRAGMA table_info({table});")
+        cols = [r[1] for r in cur.fetchall()]
+        if column not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def};")
+
+    def _verify_schema(self, cur: sqlite3.Cursor) -> None:
+        """Verifies that all required tables and columns exist in the database."""
+        required_schema = {
+            "accounts": ["account_id", "account_type", "currency", "starting_balance", "available_balance", "locked_balance", "target_balance", "affordable_loss_ceiling", "loss_baseline_inr", "cumulative_realized_loss", "tds_receivable_inr", "is_active"],
+            "orders": ["order_id", "client_order_id", "account_id", "market_pair", "side", "order_type", "status", "price", "quantity", "filled_quantity", "reserved_funds_inr", "reserved_quantity", "planned_risk_inr", "stop_loss_price", "take_profit_price", "rejection_reason", "idempotency_key"],
+            "fills": ["fill_id", "order_id", "exchange_trade_id", "market_pair", "side", "price", "quantity", "fee_inr", "gst_on_fee_inr", "tds_deducted_inr", "net_proceeds_inr", "timestamp", "is_paper"],
+            "positions": ["position_id", "account_id", "market_pair", "quantity", "reserved_quantity", "average_entry_price", "cost_basis_inr", "current_price", "unrealized_pnl_inr", "realized_pnl_inr", "is_open"],
+            "journal_entries": ["entry_id", "transaction_id", "account_id", "account_name", "debit_inr", "credit_inr", "reference_id", "description", "timestamp"],
+            "ledger_entries": ["entry_id", "account_id", "entry_type", "amount_inr", "balance_after_inr", "reference_id", "description", "timestamp"],
+            "tax_records": ["record_id", "account_id", "financial_year", "fill_id", "market_pair", "sale_proceeds_inr", "cost_basis_inr", "economic_gain_inr", "taxable_gain_vda_inr", "tax_liability_30pct_inr", "tds_withheld_1pct_inr", "timestamp"],
+            "audit_events": ["event_id", "event_type", "severity", "message", "details_json", "timestamp"],
+        }
+        for table, cols in required_schema.items():
+            cur.execute(f"PRAGMA table_info({table});")
+            existing = {r[1] for r in cur.fetchall()}
+            if not existing:
+                raise RuntimeError(f"Database migration verification failed: missing table '{table}'")
+            missing = [c for c in cols if c not in existing]
+            if missing:
+                raise RuntimeError(f"Database migration verification failed: table '{table}' missing columns {missing}")
+
     def _run_migrations(self) -> None:
-        """Applies versioned schema migrations."""
+        """Applies versioned schema migrations with legacy column backfilling and schema verification."""
         with self.session() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -150,7 +177,7 @@ class DatabaseManager:
                         entry_id TEXT PRIMARY KEY,
                         transaction_id TEXT NOT NULL,
                         account_id TEXT NOT NULL,
-                        account_name TEXT NOT NULL, -- 'CASH', 'LOCKED_CASH', 'HOLDINGS', 'FEE_EXPENSE', 'GST_EXPENSE', 'TDS_RECEIVABLE', 'REALIZED_PNL'
+                        account_name TEXT NOT NULL,
                         debit_inr REAL NOT NULL DEFAULT 0.0,
                         credit_inr REAL NOT NULL DEFAULT 0.0,
                         reference_id TEXT,
@@ -198,6 +225,27 @@ class DatabaseManager:
                     );
                     """
                 )
+                # Upgrade check for legacy pre-existing databases
+                self._ensure_column(cur, "accounts", "locked_balance", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "accounts", "tds_receivable_inr", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "accounts", "affordable_loss_ceiling", "REAL NOT NULL DEFAULT 250.0")
+                self._ensure_column(cur, "accounts", "loss_baseline_inr", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "accounts", "cumulative_realized_loss", "REAL NOT NULL DEFAULT 0.0")
+
+                self._ensure_column(cur, "orders", "reserved_funds_inr", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "orders", "reserved_quantity", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "orders", "planned_risk_inr", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "orders", "idempotency_key", "TEXT UNIQUE")
+
+                self._ensure_column(cur, "positions", "reserved_quantity", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "positions", "cost_basis_inr", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "positions", "current_price", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "positions", "unrealized_pnl_inr", "REAL NOT NULL DEFAULT 0.0")
+                self._ensure_column(cur, "positions", "realized_pnl_inr", "REAL NOT NULL DEFAULT 0.0")
+
+                # Verify full schema before committing version 1
+                self._verify_schema(cur)
+
                 cur.execute(
                     "INSERT INTO schema_migrations (version, applied_at, description) VALUES (1, datetime('now'), 'Initial balanced transactional ledger');"
                 )

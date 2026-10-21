@@ -61,6 +61,7 @@ class ExecutionStateMachine:
         ask_price: float | None = None,
         forecast_uncertainty: float = 0.0,
         idempotency_key: str | None = None,
+        require_order_book: bool = False,
     ) -> Dict[str, Any]:
         """Creates PROPOSED order, runs risk check, and transitions to AUTHORIZED or REJECTED."""
         if self.emergency.is_safe_mode_active():
@@ -100,6 +101,7 @@ class ExecutionStateMachine:
             planned_risk_inr=0.0,
             stop_loss_price=proposed_stop_loss,
             idempotency_key=idemp,
+            status=OrderState.PROPOSED.value,
         )
 
         # 2. Risk Evaluation
@@ -112,6 +114,7 @@ class ExecutionStateMachine:
             bid_price=bid_price,
             ask_price=ask_price,
             forecast_uncertainty=forecast_uncertainty,
+            require_order_book=require_order_book,
         )
 
         if not eval_result["approved"]:
@@ -181,39 +184,108 @@ class ExecutionStateMachine:
         is_maker: bool = False,
     ) -> Dict[str, Any]:
         """
-        Validates state machine transition and processes fill atomically.
+        Validates state machine transition and processes fill atomically in a single database transaction.
+        Rolls back all state and financial modifications if any validation or transition fails (P0-1).
         """
+        import math
+        if not (isinstance(price, (int, float)) and math.isfinite(price) and price > 0):
+            raise ValueError(f"Price must be a finite, strictly positive number. Got {price}")
+        if not (isinstance(quantity, (int, float)) and math.isfinite(quantity) and quantity > 0):
+            raise ValueError(f"Quantity must be a finite, strictly positive number. Got {quantity}")
+
         with self.db.session() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT status, market_pair, side, quantity, filled_quantity FROM orders WHERE order_id = ?", (order_id,))
+            cur.execute(
+                "SELECT status, market_pair, side, quantity, filled_quantity FROM orders WHERE order_id = ?",
+                (order_id,),
+            )
             order = cur.fetchone()
             if not order:
                 raise ValueError(f"Order {order_id} not found.")
 
-        current_status = order["status"]
-        if current_status not in [OrderState.SUBMITTED.value, OrderState.PARTIAL.value]:
-            raise ValueError(f"Cannot record fill for order in state {current_status}. Must be SUBMITTED or PARTIAL.")
+            current_status = OrderState(order["status"])
+            if current_status not in [OrderState.SUBMITTED, OrderState.PARTIAL]:
+                raise ValueError(f"Cannot record fill for order in state {current_status.value}. Must be SUBMITTED or PARTIAL.")
 
-        side = order["side"].upper()
-        pair = order["market_pair"]
-        tot_qty = float(order["quantity"])
-        prev_filled = float(order["filled_quantity"])
-        new_total_filled = prev_filled + quantity
+            side = order["side"].upper()
+            pair = order["market_pair"]
+            tot_qty = float(order["quantity"])
+            prev_filled = float(order["filled_quantity"])
+            new_total_filled = prev_filled + quantity
 
-        # Atomic fill recording in ledger
-        if side == "BUY":
-            fill_info = self.ledger.record_buy_fill(order_id, pair, price, quantity, exchange_trade_id, is_maker)
-        else:
-            fill_info = self.ledger.record_sell_fill(order_id, pair, price, quantity, exchange_trade_id, is_maker)
+            if new_total_filled > tot_qty + 1e-8:
+                raise ValueError(f"Fill quantity {quantity} would exceed total order quantity {tot_qty} (previously filled: {prev_filled})")
 
-        # Transition state based on completion
-        if new_total_filled >= tot_qty - 1e-8:
-            self._transition(order_id, OrderState.FILLED, filled_qty=new_total_filled)
-            self._transition(order_id, OrderState.RECONCILED)
-        else:
-            self._transition(order_id, OrderState.PARTIAL, filled_qty=new_total_filled)
+            # Validate target state transition before applying financial mutation
+            is_complete = new_total_filled >= tot_qty - 1e-8
+            target_state = OrderState.FILLED if is_complete else OrderState.PARTIAL
+            valid_targets = self.VALID_TRANSITIONS.get(current_status, set())
+            if target_state not in valid_targets:
+                raise ValueError(f"Illegal transition from {current_status.value} to {target_state.value}")
 
-        return fill_info
+            # Apply fill atomically within this same transaction
+            if side == "BUY":
+                fill_info = self.ledger.record_buy_fill(
+                    order_id=order_id,
+                    market_pair=pair,
+                    price=price,
+                    quantity=quantity,
+                    exchange_trade_id=exchange_trade_id,
+                    is_maker=is_maker,
+                    conn=conn,
+                )
+            else:
+                fill_info = self.ledger.record_sell_fill(
+                    order_id=order_id,
+                    market_pair=pair,
+                    price=price,
+                    quantity=quantity,
+                    exchange_trade_id=exchange_trade_id,
+                    is_maker=is_maker,
+                    conn=conn,
+                )
+
+            # Check if this was an idempotent duplicate fill
+            if fill_info.get("duplicate"):
+                return fill_info
+
+            # Conditional state update: verify exactly 1 row changed
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cur.execute(
+                """
+                UPDATE orders 
+                SET status = ?, filled_quantity = ?, updated_at = ?
+                WHERE order_id = ? AND status = ?
+                """,
+                (target_state.value, new_total_filled, now_iso, order_id, current_status.value),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"Order state mutation failed: expected 1 row updated, got {cur.rowcount}")
+
+            # Audit record within the same transaction
+            cur.execute(
+                """
+                INSERT INTO audit_events (event_id, event_type, severity, message, details_json, timestamp)
+                VALUES (?, 'ORDER_FILL', 'INFO', 'Order filled and transitioned atomically', ?, ?)
+                """,
+                (
+                    f"audit-{uuid.uuid4().hex[:8]}",
+                    f'{{"order_id": "{order_id}", "from_state": "{current_status.value}", "to_state": "{target_state.value}", "filled_qty": {new_total_filled}}}',
+                    now_iso,
+                ),
+            )
+
+            if is_complete:
+                cur.execute(
+                    """
+                    UPDATE orders 
+                    SET status = ?, updated_at = ?
+                    WHERE order_id = ? AND status = ?
+                    """,
+                    (OrderState.RECONCILED.value, now_iso, order_id, OrderState.FILLED.value),
+                )
+
+            return fill_info
 
     def cancel_order(self, order_id: str, reason: str = "User cancelled") -> bool:
         """

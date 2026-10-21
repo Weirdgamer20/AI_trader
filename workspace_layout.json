@@ -1,0 +1,19 @@
+{
+  "Default": {
+    "layout": [
+      "scanner_panel",
+      "chart_panel",
+      "risk_monitor",
+      "portfolio_balance"
+    ],
+    "density": "dense"
+  },
+  "ProTrader": {
+    "layout": [
+      "scanner",
+      "charts",
+      "critic"
+    ],
+    "density": "ultra"
+  }
+}
